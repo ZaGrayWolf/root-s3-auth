@@ -74,7 +74,7 @@ private:
 
    
 
-   //void ApplyS3Auth(const std::string &method, const char *rangeHeader = nullptr);
+   
 
 public:
    /// Returned by SendHeadReq() if the HTTP response contains no content-length header
