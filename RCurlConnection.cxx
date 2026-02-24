@@ -905,10 +905,7 @@ ROOT::Internal::RCurlConnection::SendRangesReq(std::size_t N, RUserRange *ranges
 }
 struct curl_slist *ROOT::Internal::RCurlConnection::ApplyS3Auth(const std::string &method, const char *rangeHeader)
 {
-   // FORCE CREDENTIALS FOR TESTING
-   fS3Credentials.fAccessKey = "AKIA_MOCK_USER";
-   fS3Credentials.fSecretKey = "MOCK_SECRET_KEY_12345"; //to be removed when real credentials are used
-   fS3Credentials.fRegion = "us-east-1";
+   
    
    if (!fHasS3Credentials) return nullptr;
 
