@@ -29,7 +29,6 @@
 #include <iomanip>
 #include <sstream>
 #include <ctime>
-#include <algorithm>
 // End of new imports 
 
 
@@ -822,10 +821,7 @@ ROOT::Internal::RCurlConnection::SendRangesReq(std::size_t N, RUserRange *ranges
    RTransferState transfer(ranges, order, fHandle);
    rc = curl_easy_setopt(fHandle, CURLOPT_WRITEDATA, &transfer);
    R__ASSERT(rc == CURLE_OK);
-/// -----
 
-   
-/// -----
 #ifndef HAS_CURL_EASY_HEADER
    rc = curl_easy_setopt(fHandle, CURLOPT_HEADERFUNCTION, CallbackHeader);
    R__ASSERT(rc == CURLE_OK);
