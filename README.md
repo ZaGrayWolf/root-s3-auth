@@ -15,26 +15,15 @@ The changes extend `RCurlConnection` so it can optionally sign HTTP requests wit
 
 `RCurlConnection` could already send HTTP HEAD and range GET requests via libcurl, but had no way to attach authentication headers. S3 requires every request to carry an `Authorization` header built from a specific HMAC-SHA256 signing chain (AWSv4). Without this, any request to a non-public S3 bucket gets rejected.
 
-The changes add:
+To support this, a new `RS3Credentials` struct and a `SetS3Credentials()` method were added so callers can pass in an access key, secret key, and region. A private `ApplyS3Auth()` method handles building the full canonical request and signing key chain, and returns a `curl_slist` that gets attached to the curl handle before each request. Both `SendHeadReq()` and `SendRangesReq()` were updated to call it when credentials are present and clean up the header list immediately after the transfer.
 
-- `RS3Credentials` struct to hold the access key, secret key, region, and optional session token
-- `SetS3Credentials()` public method to pass credentials into a connection object
-- `ApplyS3Auth()` private method that builds the full AWSv4 canonical request, derives the signing key chain, and returns a `curl_slist` with the `Authorization` and `x-amz-date` headers attached
-- Hooks in `SendHeadReq()` and `SendRangesReq()` that call `ApplyS3Auth()` when credentials are present and clean up the `curl_slist` immediately after `Perform()` returns
+## Error encountered
 
-If no credentials are set, nothing changes and the existing behaviour is preserved.
-
-## One thing I ran into
-
-On ARM64 (Apple Silicon), the intermediate HMAC-SHA256 outputs are raw binary and frequently contain null bytes. Passing them to a standard `std::string` constructor without an explicit length caused the string to terminate early at the first null byte, which produced signatures much shorter than the required 64 hex characters. The fix was to always pass the explicit byte length to the constructor so null bytes are treated as data rather than terminators.
+On ARM64 (Apple Silicon), signatures were coming out much shorter than the expected 64 hex characters. The HMAC-SHA256 output is raw binary and often contains null bytes. Passing it to a `std::string` constructor without an explicit length caused the string to cut off at the first null byte, so the full 32 bytes were not getting through. Fixed by always passing the byte length explicitly to the constructor.
 
 ## How I tested it
 
-Built ROOT 6.39 from source on macOS ARM64 with `-Dcurl=ON` and `-Ds3=ON`.
-
-Wrote a small Python mock server that listens for incoming HEAD and GET requests and prints the raw headers. Connected to it using a standalone ROOT macro that instantiates `RCurlConnection` directly, injects dummy credentials via `SetS3Credentials()`, and calls `SendHeadReq()`. Used this to verify the Authorization header format and that the signature is consistently 64 hex characters.
-
-Also verified that connections without credentials set do not get any extra headers attached, confirming no regression on standard HTTP requests.
+Wrote a small Python mock server that listens for incoming HEAD and GET requests and prints the raw headers. Used this to verify the Authorization header format and that the signature is consistently 64 hex characters. Also checked that connections without credentials set do not get any extra headers attached, to make sure plain HTTP still works.
 
 Full testing notes are in `Notes.md`.
 
