@@ -2,7 +2,7 @@
 
 ## What this does
 
-This extends `RCurlConnection` to attach AWS Signature Version 4 (SigV4) authentication headers to HTTP requests sent via libcurl. Without this, any request to a non-public S3 bucket gets a 403 rejection because the server cannot verify the caller's identity.
+This extends `RCurlConnection` to attach AWS Signature Version 4 (SigV4) authentication headers to HTTP requests sent via libcurl. Without this, any request to a non-public S3 bucket gets a 403 rejection because the server has no way to verify who is making the request.
 
 The two entry points that needed modification are `SendHeadReq()` and `SendRangesReq()`. Both now call `ApplyS3Auth()` before `Perform()` if credentials have been set, and clean up the resulting `curl_slist` immediately after the transfer completes.
 
@@ -12,9 +12,7 @@ The two entry points that needed modification are `SendHeadReq()` and `SendRange
 
 **Platform:** macOS ARM64 (Apple Silicon)
 
-**Core Issue:** ROOT's build system silently disables the `net/curl` backend if it cannot definitively locate the `libcurl` dependency. This results in a `libNet.so` that lacks `RCurlConnection` symbols, causing macros to fail at runtime or link time.
-
-A clean, out-of-source build is mandatory to prevent cached LLVM architecture maps from corrupting the configuration on macOS:
+One thing worth noting: ROOT's build system silently disables the `net/curl` backend if it cannot definitively locate the `libcurl` dependency. This results in a `libNet.so` that lacks `RCurlConnection` symbols entirely, which causes macros to fail at runtime with linker errors that are not immediately obvious. A clean out-of-source build with explicit flags avoids this:
 
 ```bash
 mkdir root-build && cd root-build
@@ -28,7 +26,7 @@ cmake ../root \
 make -j$(sysctl -n hw.ncpu)
 ```
 
-To confirm the curl backend compiled successfully into the networking library:
+To confirm the curl backend actually compiled into the networking library:
 
 ```bash
 nm -gU lib/libNet.so | grep RCurlConnection
@@ -46,7 +44,7 @@ There are three stages:
 
 ### 1. Build a Canonical Request
 
-The canonical request is a normalized string representation of the HTTP request — method, URI path, query string, headers, signed header names, and a SHA256 hash of the payload. For HEAD and range GET requests the payload is always empty, so the payload hash is always:
+The canonical request is a normalized string of the HTTP request — method, URI path, query string, headers, signed header names, and a SHA256 hash of the payload. For HEAD and range GET requests the payload is always empty, so the payload hash is always:
 
 ```
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
@@ -62,7 +60,7 @@ x-amz-date:<value>
 
 ### 2. Derive the Signing Key
 
-The signing key is derived through a chain of four HMAC-SHA256 operations, each building on the previous output:
+The signing key is not the raw secret — it is derived through a chain of four HMAC-SHA256 operations, each building on the previous output:
 
 ![AWSv4 Signing Key Derivation](sigv4-signing-key.png)
 
@@ -73,7 +71,7 @@ kService = HMAC-SHA256(kRegion, "s3")
 kSigning = HMAC-SHA256(kService, "aws4_request")
 ```
 
-The intermediate outputs are raw binary and get passed directly into the next HMAC call as keys. Only the final signature is hex-encoded.
+The intermediate outputs are raw binary and get passed directly into the next HMAC call. Only the final signature is hex-encoded.
 
 ### 3. Compute the Final Signature
 
@@ -85,24 +83,22 @@ The `StringToSign` combines the algorithm name, timestamp, credential scope, and
 
 ---
 
-## What Was Implemented
+## What Was Changed and Why
 
-### New struct: `RS3Credentials`
+### `RCurlConnection.hxx` — credential storage
 
-Added to `RCurlConnection.hxx` inside `namespace ROOT::Internal`, above the class definition:
+Added a new `RS3Credentials` struct above the class definition to hold the access key, secret key, region, and an optional session token for temporary IAM credentials:
 
 ```cpp
 struct RS3Credentials {
    std::string fAccessKey;
    std::string fSecretKey;
    std::string fRegion;
-   std::string fSessionToken; // for temporary IAM role credentials
+   std::string fSessionToken;
 };
 ```
 
-### New public method: `SetS3Credentials()`
-
-Added to `RCurlConnection` to allow callers to inject credentials:
+Added a public `SetS3Credentials()` method so callers can inject credentials into a connection object, and a private `fHasS3Credentials` boolean as a fast flag so non-S3 requests pay zero overhead:
 
 ```cpp
 void SetS3Credentials(const RS3Credentials &creds) {
@@ -111,32 +107,29 @@ void SetS3Credentials(const RS3Credentials &creds) {
 }
 ```
 
-The `fHasS3Credentials` boolean acts as a fast flag so non-S3 requests pay no cost.
+Credentials are passed by `const` reference to follow ROOT's convention for complex types and avoid unnecessary copies.
 
-### New private method: `ApplyS3Auth()`
+### `RCurlConnection.cxx` — signing logic
 
-This is the core of the implementation. It builds the full AWSv4 canonical request, derives the signing key chain, constructs the `Authorization` header, and returns a `curl_slist` for the caller to attach and later free:
+Added three helper functions to the existing anonymous namespace:
+
+```cpp
+std::string Sha256Hex(const std::string &data);
+std::string HmacSha256(const std::string &key, const std::string &data);
+std::string HmacSha256Hex(const std::string &key, const std::string &data);
+```
+
+The reason there are two HMAC functions is important: intermediate key derivation steps need raw binary output to feed into the next step. Only the very last step needs hex. Using `HmacSha256Hex` for intermediate steps would break the chain.
+
+The `ApplyS3Auth()` method builds the full canonical request, runs the key derivation chain, constructs the `Authorization` header, and returns a `curl_slist`. The caller is responsible for freeing it after `Perform()` returns:
 
 ```cpp
 struct curl_slist *ApplyS3Auth(const std::string &method, const char *rangeHeader = nullptr);
 ```
 
-Three helper functions were added to the anonymous namespace in `RCurlConnection.cxx`:
-
-```cpp
-// SHA256 of a string, hex-encoded — used for the canonical request hash
-std::string Sha256Hex(const std::string &data);
-
-// Raw binary HMAC-SHA256 — used for intermediate key derivation steps
-std::string HmacSha256(const std::string &key, const std::string &data);
-
-// Hex-encoded HMAC-SHA256 — used only for the final signature
-std::string HmacSha256Hex(const std::string &key, const std::string &data);
-```
-
 ### Hooks in `SendHeadReq()` and `SendRangesReq()`
 
-Both methods now follow the same pattern — sign if credentials are present, perform the request, then clean up:
+Both methods follow the same pattern:
 
 ```cpp
 struct curl_slist *s3Headers = nullptr;
@@ -153,32 +146,51 @@ if (s3Headers) {
 }
 ```
 
-In `SendRangesReq()` this happens inside the batch loop because the `Range` header changes per batch and must be included in the signature for each one individually. A signature computed against one range value will be rejected by S3 if the actual range sent differs.
+In `SendRangesReq()` this happens inside the batch loop because the `Range` header changes per batch and must be part of the signature for each one. If you sign against one range value and send a different one, S3 rejects the request.
+
+### Coding conventions
+
+The implementation follows ROOT's coding standards throughout. Member variables use the `f` prefix (`fS3Credentials`, `fHasS3Credentials`) to distinguish them from local variables. The cryptographic code avoids C-style casts in favour of `reinterpret_cast`, uses explicit-length `std::string` constructors to handle binary data safely, and the helpers are scoped inside the anonymous namespace to avoid polluting the global namespace — consistent with how the rest of `RCurlConnection.cxx` is structured.
 
 ---
 
 ## A Bug Found on ARM64: HMAC Null-Byte Truncation
 
-During testing on macOS ARM64 (Apple Silicon), the mock server was showing signatures much shorter than the expected 64 hex characters, and requests were failing with `SignatureDoesNotMatch`.
+During testing on macOS ARM64 the signing logic was producing signatures much shorter than the expected 64 hex characters.
 
-The HMAC-SHA256 function generates a 32-byte raw binary hash which frequently contains null bytes (`0x00`). When this binary output was passed between intermediate key derivation steps using a standard C-string constructor, the compiler treated it as a null-terminated string and truncated it at the first null byte. The downstream HMAC operations were then working with a corrupted key.
+The HMAC-SHA256 function generates a 32-byte raw binary hash which often contains null bytes (`0x00`). When this binary output was passed between key derivation steps using a standard C-string constructor, the string terminated at the first null byte. The downstream HMAC calls were then working with a truncated key and producing wrong signatures.
 
-The fix is to always use the explicit-length constructor so null bytes are treated as data:
+The fix is to always pass the explicit byte length:
 
 ```cpp
-// Correct — passes explicit byte count, null bytes included
 return std::string(reinterpret_cast<char*>(hash), hashLen);
 ```
 
-After this fix signatures were consistently 64 characters.
+After this, signatures were consistently 64 characters and the signing chain worked correctly on ARM64.
 
 ---
 
 ## Testing
 
-### Python Mock Server
+### HMAC correctness verification
 
-Built a local Python HTTP server to intercept ROOT's `HEAD` and `GET` requests and inspect the raw headers without needing live AWS credentials:
+Before touching the ROOT codebase, the three helper functions were extracted into a standalone `.cxx` file and tested against a known input:
+
+```cpp
+// Known test: HMAC-SHA256("key", "The quick brown fox jumps over the lazy dog")
+std::string result = HmacSha256Hex("key", "The quick brown fox jumps over the lazy dog");
+// Expected: f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8
+```
+
+The output matched exactly, confirming the cryptographic logic was correct before integration.
+
+### Manual header inspection via AWS documentation
+
+The canonical request format, `StringToSign` structure, and `Authorization` header format were verified by tracing through the implementation step by step against the examples in the [AWS SigV4 documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html). The alphabetical header sorting, the empty payload hash, and the credential scope format were all cross-checked against the spec.
+
+### Python mock server
+
+Wrote a local Python HTTP server to inspect the raw headers that ROOT would send, without needing live AWS credentials:
 
 ```python
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -207,39 +219,12 @@ class S3Mock(BaseHTTPRequestHandler):
 HTTPServer(('127.0.0.1', 9000), S3Mock).serve_forever()
 ```
 
-### Standalone Macro
+### What was verified
 
-Rather than going through `TFile::Open`, wrote a direct C++ macro to instantiate `RCurlConnection` and trigger `SendHeadReq()` in isolation:
-
-```cpp
-// final_proof.C
-#pragma cling add_include_path("../root/net/curl/inc")
-#include "ROOT/RCurlConnection.hxx"
-
-void final_proof() {
-   gSystem->Load("libNet");
-   ROOT::Internal::RCurlConnection conn("http://127.0.0.1:9000/test/verify.root");
-   ROOT::Internal::RS3Credentials creds;
-   creds.fAccessKey = "minioadmin";
-   creds.fSecretKey = "minioadmin";
-   creds.fRegion    = "us-east-1";
-   conn.SetS3Credentials(creds);
-   uint64_t size = 0;
-   conn.SendHeadReq(size);
-}
-```
-
-Run in compiled mode to force proper linking against `libNet`:
-
-```bash
-./bin/root -l -b -q "final_proof.C+"
-```
-
-### What Was Verified
-
-- `Authorization` header present and starts with `AWS4-HMAC-SHA256`
+- HMAC helper functions produce correct output against known test vectors
+- `Authorization` header starts with `AWS4-HMAC-SHA256` and contains `Credential`, `SignedHeaders`, and `Signature` fields
 - Signature is consistently 64 hex characters
-- `x-amz-date` present and correctly formatted
-- For GET requests, `range` appears in both the header and in `SignedHeaders` inside the Authorization value
+- `x-amz-date` is present and correctly formatted
+- For GET requests, `range` appears in both the header list and in `SignedHeaders`
 - For HEAD requests, `range` is absent from both
-- Connections with no credentials set receive no extra headers — no regression on plain HTTP requests
+- Connections with no credentials set receive no extra headers — no regression on plain HTTP
