@@ -29,7 +29,6 @@
 #include <iomanip>
 #include <sstream>
 #include <ctime>
-// End of new imports 
 
 
 #if LIBCURL_VERSION_NUM >= 0x078300
@@ -767,16 +766,15 @@ ROOT::Internal::RCurlConnection::RStatus ROOT::Internal::RCurlConnection::SendHe
    RStatus status;
    struct curl_slist *s3Headers = nullptr;
 
-   // 1. Apply S3 Auth if needed
+   //Apply S3 Auth 
    if (fHasS3Credentials) {
       s3Headers = ApplyS3Auth("HEAD");
       curl_easy_setopt(fHandle, CURLOPT_HTTPHEADER, s3Headers);
    }
 
-   // 2. Perform the single network call
    Perform(status);
 
-   // 3. Cleanup S3 headers immediately
+   // reset header list so it does not persist to next request
    if (s3Headers) {
       curl_easy_setopt(fHandle, CURLOPT_HTTPHEADER, nullptr);
       curl_slist_free_all(s3Headers);
@@ -905,7 +903,7 @@ struct curl_slist *ROOT::Internal::RCurlConnection::ApplyS3Auth(const std::strin
    
    if (!fHasS3Credentials) return nullptr;
 
-   // 1. Generate ISO8601 timestamps
+// timestamp for x-amz-date and credential scope
    time_t now = time(nullptr);
    struct tm gmt;
    gmtime_r(&now, &gmt);
@@ -913,7 +911,7 @@ struct curl_slist *ROOT::Internal::RCurlConnection::ApplyS3Auth(const std::strin
    strftime(amzDate, 17, "%Y%m%dT%H%M%SZ", &gmt);
    strftime(dateStamp, 9, "%Y%m%d", &gmt);
 
-   // 2. Extract Host and Path from the escaped URL
+// extract host and path from the already-escaped URL
    CURLU *cu = curl_url();
    curl_url_set(cu, CURLUPART_URL, fEscapedUrl.c_str(), 0);
    char *hostPtr, *pathPtr;
@@ -922,7 +920,7 @@ struct curl_slist *ROOT::Internal::RCurlConnection::ApplyS3Auth(const std::strin
    std::string host(hostPtr), path(pathPtr);
    curl_free(hostPtr); curl_free(pathPtr); curl_url_cleanup(cu);
 
-   // 3. Alphabetically sorted Canonical Headers
+// headers must be sorted alphabetically per SigV4 spec
    std::string signedHeaders = "host";
    std::string canonicalHeaders = "host:" + host + "\n";
    if (rangeHeader) {
@@ -932,14 +930,14 @@ struct curl_slist *ROOT::Internal::RCurlConnection::ApplyS3Auth(const std::strin
    signedHeaders += ";x-amz-date";
    canonicalHeaders += "x-amz-date:" + std::string(amzDate) + "\n";
 
-   // 4. Construct String to Sign
+   // empty payload hash — HEAD and range GETs have no body
    std::string canonicalRequest = method + "\n" + path + "\n\n" + canonicalHeaders + "\n" + signedHeaders + "\n" +
                                  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
    std::string credentialScope = std::string(dateStamp) + "/" + fS3Credentials.fRegion + "/s3/aws4_request";
    std::string stringToSign = "AWS4-HMAC-SHA256\n" + std::string(amzDate) + "\n" + credentialScope + "\n" + Sha256Hex(canonicalRequest);
 
-   // 5. Key Derivation (The chain of trust)
+   // derive signing key: each step feeds raw binary into the next
    std::string kSecret = "AWS4" + fS3Credentials.fSecretKey;
    std::string kDate = HmacSha256(kSecret, dateStamp);
    std::string kRegion = HmacSha256(kDate, fS3Credentials.fRegion);
@@ -947,7 +945,7 @@ struct curl_slist *ROOT::Internal::RCurlConnection::ApplyS3Auth(const std::strin
    std::string kSigning = HmacSha256(kService, "aws4_request");
    std::string signature = HmacSha256Hex(kSigning, stringToSign);
 
-   // 6. Build final SList for CURL
+  // build and return the header list — caller frees it after Perform()
    std::string authVal = "AWS4-HMAC-SHA256 Credential=" + fS3Credentials.fAccessKey + "/" + credentialScope +
                          ", SignedHeaders=" + signedHeaders + ", Signature=" + signature;
 
