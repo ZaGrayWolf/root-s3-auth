@@ -1,10 +1,8 @@
 # RCurlConnection S3 Extension: Implementation and Testing Notes
 
-## What this does
+## What the code does
 
-This extends `RCurlConnection` to attach AWS Signature Version 4 (SigV4) authentication headers to HTTP requests sent via libcurl. Without this, any request to a non-public S3 bucket gets a 403 rejection because the server has no way to verify who is making the request.
-
-The two entry points that needed modification are `SendHeadReq()` and `SendRangesReq()`. Both now call `ApplyS3Auth()` before `Perform()` if credentials have been set, and clean up the resulting `curl_slist` immediately after the transfer completes.
+`RCurlConnection` handles HTTP HEAD and range GET requests via libcurl, but had no way to attach authentication headers. This extends it to support AWS Signature Version 4 so it can talk to authenticated S3 buckets. Both `SendHeadReq()` and `SendRangesReq()` now sign requests when credentials are present and clean up immediately after the transfer completes.
 
 ---
 
@@ -83,82 +81,25 @@ The `StringToSign` combines the algorithm name, timestamp, credential scope, and
 
 ---
 
-## What Was Changed and Why
+## What Was Changed
 
-### `RCurlConnection.hxx` — credential storage
+The header file got a new `RS3Credentials` struct to hold the access key, secret key, region, and an optional session token for temporary IAM credentials. A public `SetS3Credentials()` method lets callers inject credentials into a connection object, and a private `fHasS3Credentials` boolean means non-S3 requests pay zero overhead since the check is just a flag read.
 
-Added a new `RS3Credentials` struct above the class definition to hold the access key, secret key, region, and an optional session token for temporary IAM credentials:
+On the implementation side, three helper functions went into the existing anonymous namespace — `Sha256Hex` for hashing the canonical request, `HmacSha256` for the intermediate key derivation steps which need raw binary output, and `HmacSha256Hex` for the final signature which needs hex. Having two separate HMAC functions matters because feeding hex into the middle of the key chain would break it — the intermediate steps need to stay as raw binary all the way through.
 
-```cpp
-struct RS3Credentials {
-   std::string fAccessKey;
-   std::string fSecretKey;
-   std::string fRegion;
-   std::string fSessionToken;
-};
-```
-
-Added a public `SetS3Credentials()` method so callers can inject credentials into a connection object, and a private `fHasS3Credentials` boolean as a fast flag so non-S3 requests pay zero overhead:
-
-```cpp
-void SetS3Credentials(const RS3Credentials &creds) {
-   fS3Credentials = creds;
-   fHasS3Credentials = !fS3Credentials.fAccessKey.empty();
-}
-```
-
-Credentials are passed by `const` reference to follow ROOT's convention for complex types and avoid unnecessary copies.
-
-### `RCurlConnection.cxx` — signing logic
-
-Added three helper functions to the existing anonymous namespace:
-
-```cpp
-std::string Sha256Hex(const std::string &data);
-std::string HmacSha256(const std::string &key, const std::string &data);
-std::string HmacSha256Hex(const std::string &key, const std::string &data);
-```
-
-The reason there are two HMAC functions is important: intermediate key derivation steps need raw binary output to feed into the next step. Only the very last step needs hex. Using `HmacSha256Hex` for intermediate steps would break the chain.
-
-The `ApplyS3Auth()` method builds the full canonical request, runs the key derivation chain, constructs the `Authorization` header, and returns a `curl_slist`. The caller is responsible for freeing it after `Perform()` returns:
-
-```cpp
-struct curl_slist *ApplyS3Auth(const std::string &method, const char *rangeHeader = nullptr);
-```
-
-### Hooks in `SendHeadReq()` and `SendRangesReq()`
-
-Both methods follow the same pattern:
-
-```cpp
-struct curl_slist *s3Headers = nullptr;
-if (fHasS3Credentials) {
-   s3Headers = ApplyS3Auth("HEAD");
-   curl_easy_setopt(fHandle, CURLOPT_HTTPHEADER, s3Headers);
-}
-
-Perform(status);
-
-if (s3Headers) {
-   curl_easy_setopt(fHandle, CURLOPT_HTTPHEADER, nullptr);
-   curl_slist_free_all(s3Headers);
-}
-```
-
-In `SendRangesReq()` this happens inside the batch loop because the `Range` header changes per batch and must be part of the signature for each one. If you sign against one range value and send a different one, S3 rejects the request.
+The actual signing happens in `ApplyS3Auth()` which builds the canonical request, runs the key chain, constructs the `Authorization` header, and returns a `curl_slist`. Both `SendHeadReq()` and `SendRangesReq()` call it before `Perform()` when credentials are set and free the list right after. In `SendRangesReq()` this happens inside the batch loop because the `Range` header changes per batch and needs to be part of the signature each time — if the signed range and the actual sent range differ, S3 will reject it.
 
 ### Coding conventions
 
-The implementation follows ROOT's coding standards throughout. Member variables use the `f` prefix (`fS3Credentials`, `fHasS3Credentials`) to distinguish them from local variables. The cryptographic code avoids C-style casts in favour of `reinterpret_cast`, uses explicit-length `std::string` constructors to handle binary data safely, and the helpers are scoped inside the anonymous namespace to avoid polluting the global namespace — consistent with how the rest of `RCurlConnection.cxx` is structured.
+The implementation tried to follow ROOT's coding conventions throughout (https://root.cern/contribute/coding_conventions/). Member variables use the `f` prefix (`fS3Credentials`, `fHasS3Credentials`) which is standard across the codebase. C-style casts were avoided in favour of `reinterpret_cast`, binary data is handled with explicit-length `std::string` constructors, and the helper functions sit inside the anonymous namespace to keep things scoped — same as the rest of `RCurlConnection.cxx`.
 
 ---
 
-## A Bug Found on ARM64: HMAC Null-Byte Truncation
+## Error Encountered: HMAC Null-Byte Truncation
 
 During testing on macOS ARM64 the signing logic was producing signatures much shorter than the expected 64 hex characters.
 
-The HMAC-SHA256 function generates a 32-byte raw binary hash which often contains null bytes (`0x00`). When this binary output was passed between key derivation steps using a standard C-string constructor, the string terminated at the first null byte. The downstream HMAC calls were then working with a truncated key and producing wrong signatures.
+The HMAC-SHA256 function generates a 32-byte raw binary hash which often contains null bytes (`0x00`). When this binary output was passed between key derivation steps using a standard C-string constructor, the string cut off at the first null byte so the full 32 bytes were not getting through. The downstream HMAC calls were then working with a truncated key.
 
 The fix is to always pass the explicit byte length:
 
@@ -166,31 +107,31 @@ The fix is to always pass the explicit byte length:
 return std::string(reinterpret_cast<char*>(hash), hashLen);
 ```
 
-After this, signatures were consistently 64 characters and the signing chain worked correctly on ARM64.
+After this, signatures were consistently 64 characters.
 
 ---
 
 ## Testing
 
-### HMAC correctness verification
+### HMAC correctness
 
-Before touching the ROOT codebase, the three helper functions were extracted into a standalone `.cxx` file and tested against a known input:
+Before touching the ROOT codebase, the helper functions were pulled into a standalone `.cxx` file and tested against a known input to make sure the math was right before integration:
 
 ```cpp
-// Known test: HMAC-SHA256("key", "The quick brown fox jumps over the lazy dog")
-std::string result = HmacSha256Hex("key", "The quick brown fox jumps over the lazy dog");
+// HMAC-SHA256("key", "The quick brown fox jumps over the lazy dog")
 // Expected: f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8
+std::string result = HmacSha256Hex("key", "The quick brown fox jumps over the lazy dog");
 ```
 
-The output matched exactly, confirming the cryptographic logic was correct before integration.
+Output matched.
 
-### Manual header inspection via AWS documentation
+### Manual cross-check against AWS docs
 
-The canonical request format, `StringToSign` structure, and `Authorization` header format were verified by tracing through the implementation step by step against the examples in the [AWS SigV4 documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html). The alphabetical header sorting, the empty payload hash, and the credential scope format were all cross-checked against the spec.
+The canonical request format, `StringToSign` structure, and `Authorization` header format were traced through step by step against the examples in the [AWS SigV4 documentation](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html) to verify the alphabetical header sorting, empty payload hash, and credential scope format were all correct.
 
 ### Python mock server
 
-Wrote a local Python HTTP server to inspect the raw headers that ROOT would send, without needing live AWS credentials:
+Wrote a local Python HTTP server to intercept ROOT's `HEAD` and `GET` requests and look at the raw headers without needing live AWS credentials:
 
 ```python
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -219,12 +160,4 @@ class S3Mock(BaseHTTPRequestHandler):
 HTTPServer(('127.0.0.1', 9000), S3Mock).serve_forever()
 ```
 
-### What was verified
-
-- HMAC helper functions produce correct output against known test vectors
-- `Authorization` header starts with `AWS4-HMAC-SHA256` and contains `Credential`, `SignedHeaders`, and `Signature` fields
-- Signature is consistently 64 hex characters
-- `x-amz-date` is present and correctly formatted
-- For GET requests, `range` appears in both the header list and in `SignedHeaders`
-- For HEAD requests, `range` is absent from both
-- Connections with no credentials set receive no extra headers — no regression on plain HTTP
+Used this to verify the `Authorization` header format, that signatures are consistently 64 hex characters, that `range` shows up in `SignedHeaders` for GET requests but not HEAD, and that plain HTTP connections without credentials set get no extra headers to make sure nothing broke.
