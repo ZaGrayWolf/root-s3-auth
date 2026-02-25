@@ -161,3 +161,8 @@ HTTPServer(('127.0.0.1', 9000), S3Mock).serve_forever()
 ```
 
 Used this to verify the `Authorization` header format, that signatures are consistently 64 hex characters, that `range` shows up in `SignedHeaders` for GET requests but not HEAD, and that plain HTTP connections without credentials set get no extra headers to make sure nothing broke.
+
+## Further Testing
+
+A more robust test would be setting up a local MinIO instance to verify that authenticated requests actually go through end-to-end, rather than just checking header format. Running the ROOT test suite against the modified `libNet` would also be a good sanity check.
+
