@@ -23,13 +23,6 @@
 
 #include <curl/curl.h>
 
-//new imports
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
-#include <iomanip>
-#include <sstream>
-#include <ctime>
-
 
 #if LIBCURL_VERSION_NUM >= 0x078300
 #define HAS_CURL_EASY_HEADER
@@ -39,35 +32,12 @@
 #define HAS_CURL_URL_STRERROR
 #endif
 
+
+#if LIBCURL_VERSION_NUM >= 0x074B00
+#define HAS_CURL_AWS_SIGV4
+#endif
+
 namespace {
-
-std::string Sha256Hex(const std::string &data) {
-   unsigned char hash[SHA256_DIGEST_LENGTH];
-   SHA256(reinterpret_cast<const unsigned char *>(data.data()), data.size(), hash);
-   std::stringstream ss;
-   for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
-      ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
-   return ss.str();
-}
-
-std::string HmacSha256(const std::string &key, const std::string &data) {
-   unsigned char hash[EVP_MAX_MD_SIZE];
-   unsigned int hashLen = 0;
-   HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
-        reinterpret_cast<const unsigned char*>(data.data()), data.size(), hash, &hashLen);
-   return std::string(reinterpret_cast<char*>(hash), hashLen);
-}
-
-std::string HmacSha256Hex(const std::string &key, const std::string &data) {
-   unsigned char hash[EVP_MAX_MD_SIZE];
-   unsigned int hashLen = 0;
-   HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
-        reinterpret_cast<const unsigned char*>(data.data()), data.size(), hash, &hashLen);
-   std::stringstream ss;
-   for (unsigned int i = 0; i < hashLen; i++)
-      ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
-   return ss.str();
-}
 
 
 static constexpr int kHttpResponseSuccessClass = 2;
@@ -764,21 +734,23 @@ ROOT::Internal::RCurlConnection::RStatus ROOT::Internal::RCurlConnection::SendHe
 #endif
 
    RStatus status;
-   struct curl_slist *s3Headers = nullptr;
-
-   //Apply S3 Auth 
+#ifdef HAS_CURL_AWS_SIGV4
+   // Apply S3 Auth 
    if (fHasS3Credentials) {
-      s3Headers = ApplyS3Auth("HEAD");
-      curl_easy_setopt(fHandle, CURLOPT_HTTPHEADER, s3Headers);
+      std::string userpwd = fS3Credentials.fAccessKey + ":" + fS3Credentials.fSecretKey;
+      curl_easy_setopt(fHandle, CURLOPT_USERPWD, userpwd.c_str());
+      
+      std::string sigv4_provider = "aws:amz:" + fS3Credentials.fRegion + ":s3";
+      curl_easy_setopt(fHandle, CURLOPT_AWS_SIGV4, sigv4_provider.c_str());
    }
+   else {
+   curl_easy_setopt(fHandle, CURLOPT_AWS_SIGV4, nullptr);
+   curl_easy_setopt(fHandle, CURLOPT_USERPWD, nullptr);
+}
+#endif
+
 
    Perform(status);
-
-   // reset header list so it does not persist to next request
-   if (s3Headers) {
-      curl_easy_setopt(fHandle, CURLOPT_HTTPHEADER, nullptr);
-      curl_slist_free_all(s3Headers);
-   }
 
    if (status) {
       curl_off_t length = -1;
@@ -849,11 +821,20 @@ ROOT::Internal::RCurlConnection::SendRangesReq(std::size_t N, RUserRange *ranges
          rc = curl_easy_setopt(fHandle, CURLOPT_RANGE, rangeHeader.c_str());
          R__ASSERT(rc == CURLE_OK);
 
-         struct curl_slist *batchHeaders = nullptr;
+#ifdef HAS_CURL_AWS_SIGV4
          if (fHasS3Credentials) {
-            batchHeaders = ApplyS3Auth("GET", rangeHeader.c_str());
-            curl_easy_setopt(fHandle, CURLOPT_HTTPHEADER, batchHeaders);
+            std::string userpwd = fS3Credentials.fAccessKey + ":" + fS3Credentials.fSecretKey;
+            curl_easy_setopt(fHandle, CURLOPT_USERPWD, userpwd.c_str());
+            
+            std::string sigv4_provider = "aws:amz:" + fS3Credentials.fRegion + ":s3";
+            curl_easy_setopt(fHandle, CURLOPT_AWS_SIGV4, sigv4_provider.c_str());
          }
+         else {
+            curl_easy_setopt(fHandle, CURLOPT_AWS_SIGV4, nullptr);
+            curl_easy_setopt(fHandle, CURLOPT_USERPWD, nullptr);        
+         }
+#endif
+
 
          if (b > 0) {
             const std::uint64_t lastByteRequested = requestRanges[b - 1].fLastByte;
@@ -868,14 +849,7 @@ ROOT::Internal::RCurlConnection::SendRangesReq(std::size_t N, RUserRange *ranges
 
          transfer.fResponseCode = 0; // reset HTTP response code for the next request
          Perform(status);
-// ----
-         if (batchHeaders) {
-            curl_easy_setopt(fHandle, CURLOPT_HTTPHEADER, nullptr);
-            curl_slist_free_all(batchHeaders);
-         }
 
-
-         // ---
          if ((status.fStatusCode == RStatus::kTooManyRanges) && (batchSize > 1)) {
             batchSize /= 2;
             tryAgain = true;
@@ -896,66 +870,4 @@ ROOT::Internal::RCurlConnection::SendRangesReq(std::size_t N, RUserRange *ranges
    ReverseDisplacements(displacements, ranges, order, static_cast<bool>(status));
 
    return status;
-}
-struct curl_slist *ROOT::Internal::RCurlConnection::ApplyS3Auth(const std::string &method, const char *rangeHeader)
-{
-   
-   
-   if (!fHasS3Credentials) return nullptr;
-
-// timestamp for x-amz-date and credential scope
-   time_t now = time(nullptr);
-   struct tm gmt;
-   gmtime_r(&now, &gmt);
-   char amzDate[17], dateStamp[9];
-   strftime(amzDate, 17, "%Y%m%dT%H%M%SZ", &gmt);
-   strftime(dateStamp, 9, "%Y%m%d", &gmt);
-
-// extract host and path from the already-escaped URL
-   CURLU *cu = curl_url();
-   curl_url_set(cu, CURLUPART_URL, fEscapedUrl.c_str(), 0);
-   char *hostPtr, *pathPtr;
-   curl_url_get(cu, CURLUPART_HOST, &hostPtr, 0);
-   curl_url_get(cu, CURLUPART_PATH, &pathPtr, 0);
-   std::string host(hostPtr), path(pathPtr);
-   curl_free(hostPtr); curl_free(pathPtr); curl_url_cleanup(cu);
-
-// headers must be sorted alphabetically per SigV4 spec
-   std::string signedHeaders = "host";
-   std::string canonicalHeaders = "host:" + host + "\n";
-   if (rangeHeader) {
-      signedHeaders += ";range";
-      canonicalHeaders += "range:bytes=" + std::string(rangeHeader) + "\n";
-   }
-   signedHeaders += ";x-amz-date";
-   canonicalHeaders += "x-amz-date:" + std::string(amzDate) + "\n";
-
-   // empty payload hash — HEAD and range GETs have no body
-   std::string canonicalRequest = method + "\n" + path + "\n\n" + canonicalHeaders + "\n" + signedHeaders + "\n" +
-                                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-   std::string credentialScope = std::string(dateStamp) + "/" + fS3Credentials.fRegion + "/s3/aws4_request";
-   std::string stringToSign = "AWS4-HMAC-SHA256\n" + std::string(amzDate) + "\n" + credentialScope + "\n" + Sha256Hex(canonicalRequest);
-
-   // derive signing key: each step feeds raw binary into the next
-   std::string kSecret = "AWS4" + fS3Credentials.fSecretKey;
-   std::string kDate = HmacSha256(kSecret, dateStamp);
-   std::string kRegion = HmacSha256(kDate, fS3Credentials.fRegion);
-   std::string kService = HmacSha256(kRegion, "s3");
-   std::string kSigning = HmacSha256(kService, "aws4_request");
-   std::string signature = HmacSha256Hex(kSigning, stringToSign);
-
-  // build and return the header list — caller frees it after Perform()
-   std::string authVal = "AWS4-HMAC-SHA256 Credential=" + fS3Credentials.fAccessKey + "/" + credentialScope +
-                         ", SignedHeaders=" + signedHeaders + ", Signature=" + signature;
-
-   struct curl_slist *headers = nullptr;
-   headers = curl_slist_append(headers, ("x-amz-date: " + std::string(amzDate)).c_str());
-   headers = curl_slist_append(headers, ("Authorization: " + authVal).c_str());
-   if (!fS3Credentials.fSessionToken.empty())
-      headers = curl_slist_append(headers, ("x-amz-security-token: " + fS3Credentials.fSessionToken).c_str());
-   if (rangeHeader)
-      headers = curl_slist_append(headers, ("range: bytes=" + std::string(rangeHeader)).c_str());
-
-   return headers;
 }
