@@ -4,7 +4,7 @@
 /*************************************************************************
  * Copyright (C) 1995-2025, Rene Brun and Fons Rademakers.               *
  * All rights reserved.                                                  *
- *                                                                       *
+ * *
  * For the licensing terms see $ROOTSYS/LICENSE.                         *
  * For the list of contributors see $ROOTSYS/README/CREDITS.             *
  *************************************************************************/
@@ -21,7 +21,6 @@
 
 namespace ROOT {
 namespace Internal {
-
 
 //struct to hold S3 credentials for Signature V4 authentication
 struct RS3Credentials {
@@ -65,16 +64,11 @@ private:
 
    RS3Credentials fS3Credentials;                                          ///< S3 Access/Secret keys
    bool fHasS3Credentials = false;                                         ///< Flag to enable SigV4
-   struct curl_slist *ApplyS3Auth(const std::string &method, const char *rangeHeader = nullptr);
 
    void SetupErrorBuffer();
    void SetOptions();
    RResult<void> SetUrl(const std::string &url);
    void Perform(RStatus &status);
-
-   
-
-   
 
 public:
    /// Returned by SendHeadReq() if the HTTP response contains no content-length header
