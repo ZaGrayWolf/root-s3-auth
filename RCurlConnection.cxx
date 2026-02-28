@@ -828,8 +828,7 @@ ROOT::Internal::RCurlConnection::SendRangesReq(std::size_t N, RUserRange *ranges
             
             std::string sigv4_provider = "aws:amz:" + fS3Credentials.fRegion + ":s3";
             curl_easy_setopt(fHandle, CURLOPT_AWS_SIGV4, sigv4_provider.c_str());
-         }
-         else {
+         } else {
             curl_easy_setopt(fHandle, CURLOPT_AWS_SIGV4, nullptr);
             curl_easy_setopt(fHandle, CURLOPT_USERPWD, nullptr);        
          }
