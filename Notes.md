@@ -80,7 +80,7 @@ In `SendRangesReq()`, the auth options are set inside the batch loop because the
 
 ### Coding conventions
 
-The implementation tried to follow ROOT's coding conventions throughout (https://root.cern/contribute/coding_conventions/). Member variables use the `f` prefix (`fS3Credentials`, `fHasS3Credentials`), which is standard across the codebase. Preprocessor version guards follow the same pattern as the existing `HAS_CURL_EASY_HEADER` and `HAS_CURL_URL_STRERROR` guards already in the file.
+The implementation follows ROOT's coding conventions throughout (https://root.cern/contribute/coding_conventions/). Member variables use the `f` prefix (`fS3Credentials`, `fHasS3Credentials`), which is standard across the codebase. Preprocessor version guards follow the same pattern as the existing `HAS_CURL_EASY_HEADER` and `HAS_CURL_URL_STRERROR` guards already in the file.
 
 ## Testing
 
