@@ -742,8 +742,7 @@ ROOT::Internal::RCurlConnection::RStatus ROOT::Internal::RCurlConnection::SendHe
       
       std::string sigv4_provider = "aws:amz:" + fS3Credentials.fRegion + ":s3";
       curl_easy_setopt(fHandle, CURLOPT_AWS_SIGV4, sigv4_provider.c_str());
-   }
-   else {
+   } else {
    curl_easy_setopt(fHandle, CURLOPT_AWS_SIGV4, nullptr);
    curl_easy_setopt(fHandle, CURLOPT_USERPWD, nullptr);
 }
